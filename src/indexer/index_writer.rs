@@ -811,6 +811,9 @@ impl<D: Document> Drop for IndexWriter<D> {
         for work in self.workers_join_handle.drain(..) {
             let _ = work.join();
         }
+        // Merges can retain files or an accepted metadata write after kill.
+        // Drain them before releasing the writer lock, without committing pending changes.
+        let _ = self.segment_updater.wait_merging_thread();
     }
 }
 
