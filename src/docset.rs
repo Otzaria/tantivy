@@ -190,6 +190,7 @@ pub trait DocSet: Send {
     }
 }
 
+/// Outcome of a candidate-only [`DocSet::seek_danger`] probe.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeekDangerResult {
     /// The target was found in the DocSet.
