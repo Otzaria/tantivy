@@ -5,7 +5,11 @@ use std::io::Write;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::Mutex;
 use std::sync::{Arc, RwLock};
+#[cfg(windows)]
+use std::{thread, time::Duration};
 
 use rayon::{ThreadPool, ThreadPoolBuilder};
 
@@ -75,11 +79,43 @@ impl Deref for SegmentUpdater {
 fn garbage_collect_files(
     segment_updater: SegmentUpdater,
 ) -> crate::Result<GarbageCollectionResult> {
-    info!("Running garbage collection");
+    #[cfg(not(windows))]
+    {
+        info!("Running garbage collection");
+        let mut index = segment_updater.index.clone();
+        index
+            .directory_mut()
+            .garbage_collect(move || segment_updater.list_files())
+    }
+
+    #[cfg(windows)]
+    {
+        let (result, blocked) = windows_garbage_collect_files(&segment_updater);
+        if blocked {
+            segment_updater.retry_garbage_collection();
+        }
+        result
+    }
+}
+
+#[cfg(windows)]
+fn windows_garbage_collect_files(
+    segment_updater: &SegmentUpdater,
+) -> (crate::Result<GarbageCollectionResult>, bool) {
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    const ERROR_USER_MAPPED_FILE: i32 = 1224;
+    let mut blocked = false;
     let mut index = segment_updater.index.clone();
-    index
-        .directory_mut()
-        .garbage_collect(move || segment_updater.list_files())
+    let result = index.directory_mut().garbage_collect_with_delete_errors(
+        || segment_updater.list_files(),
+        |error| {
+            blocked |= matches!(
+                error.raw_os_error(),
+                Some(ERROR_SHARING_VIOLATION | ERROR_USER_MAPPED_FILE)
+            );
+        },
+    );
+    (result, blocked)
 }
 
 /// Merges a list of segments the list of segment givens in the `segment_entries`.
@@ -267,6 +303,10 @@ pub(crate) struct InnerSegmentUpdater {
     killed: AtomicBool,
     stamper: Stamper,
     merge_operations: MergeOperationInventory,
+    #[cfg(windows)]
+    gc_retry_active: AtomicBool,
+    #[cfg(windows)]
+    gc_retry_gate: Mutex<()>,
 }
 
 impl SegmentUpdater {
@@ -316,6 +356,10 @@ impl SegmentUpdater {
             killed: AtomicBool::new(false),
             stamper,
             merge_operations: Default::default(),
+            #[cfg(windows)]
+            gc_retry_active: AtomicBool::new(false),
+            #[cfg(windows)]
+            gc_retry_gate: Mutex::new(()),
         })))
     }
 
@@ -361,6 +405,9 @@ impl SegmentUpdater {
 
     pub fn kill(&mut self) {
         self.killed.store(true, Ordering::Release);
+        // A retry must finish before rollback or Drop hands off the writer lock.
+        #[cfg(windows)]
+        drop(self.gc_retry_gate.lock().unwrap());
     }
 
     pub fn is_alive(&self) -> bool {
@@ -422,6 +469,48 @@ impl SegmentUpdater {
     pub fn schedule_garbage_collect(&self) -> FutureResult<GarbageCollectionResult> {
         let self_clone = self.clone();
         self.schedule_task(move || garbage_collect_files(self_clone))
+    }
+
+    #[cfg(windows)]
+    fn retry_garbage_collection(&self) {
+        if self.gc_retry_active.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let weak = Arc::downgrade(&self.0);
+        let spawned = thread::Builder::new()
+            .name("segment_gc_retry".to_string())
+            .spawn(move || {
+                let mut delay = Duration::from_millis(100);
+                loop {
+                    thread::sleep(delay);
+                    let Some(updater) = weak.upgrade().map(SegmentUpdater) else {
+                        break;
+                    };
+                    let retry = updater.clone();
+                    let keep_retrying = updater
+                        .schedule_task(move || {
+                            let _gate = retry.gc_retry_gate.lock().unwrap();
+                            if !retry.is_alive() {
+                                return Ok(false);
+                            }
+                            // Recalculate the live set on the updater thread before
+                            // each deletion. A path may be in use again by then.
+                            let (result, blocked) = windows_garbage_collect_files(&retry);
+                            let pending = blocked || result.is_err();
+                            retry.gc_retry_active.store(pending, Ordering::Relaxed);
+                            Ok(pending)
+                        })
+                        .wait();
+                    if !matches!(keep_retrying, Ok(true)) {
+                        break;
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(30));
+                }
+            });
+        if let Err(error) = spawned {
+            self.gc_retry_active.store(false, Ordering::Relaxed);
+            warn!("Could not schedule garbage collection retry: {error}");
+        }
     }
 
     /// List the files that are useful to the index.

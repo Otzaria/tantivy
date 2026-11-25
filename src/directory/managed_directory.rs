@@ -110,6 +110,14 @@ impl ManagedDirectory {
         &mut self,
         get_living_files: L,
     ) -> crate::Result<GarbageCollectionResult> {
+        self.garbage_collect_with_delete_errors(get_living_files, |_| {})
+    }
+
+    pub(crate) fn garbage_collect_with_delete_errors<L: FnOnce() -> HashSet<PathBuf>>(
+        &mut self,
+        get_living_files: L,
+        mut on_delete_error: impl FnMut(&io::Error),
+    ) -> crate::Result<GarbageCollectionResult> {
         info!("Garbage collect");
         let mut files_to_delete = vec![];
 
@@ -165,7 +173,8 @@ impl ManagedDirectory {
                         DeleteError::FileDoesNotExist(_) => {
                             deleted_files.push(file_to_delete.clone());
                         }
-                        DeleteError::IoError { .. } => {
+                        DeleteError::IoError { io_error, .. } => {
+                            on_delete_error(&io_error);
                             failed_to_delete_files.push(file_to_delete.clone());
                             if !cfg!(target_os = "windows") {
                                 // On windows, delete is expected to fail if the file
