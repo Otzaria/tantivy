@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::ops::Deref;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::index::SegmentId;
 use crate::{Inventory, Opstamp, TrackedObject};
@@ -19,6 +20,9 @@ impl MergeOperationInventory {
     pub fn segment_in_merge(&self) -> HashSet<SegmentId> {
         let mut segment_in_merge = HashSet::default();
         for merge_op in self.list() {
+            if merge_op.completed.load(Ordering::Relaxed) {
+                continue;
+            }
             for &segment_id in &merge_op.segment_ids {
                 segment_in_merge.insert(segment_id);
             }
@@ -47,6 +51,7 @@ pub struct MergeOperation {
 pub(crate) struct InnerMergeOperation {
     target_opstamp: Opstamp,
     segment_ids: Vec<SegmentId>,
+    completed: AtomicBool,
 }
 
 impl MergeOperation {
@@ -58,10 +63,17 @@ impl MergeOperation {
         let inner_merge_operation = InnerMergeOperation {
             target_opstamp,
             segment_ids,
+            completed: AtomicBool::new(false),
         };
         MergeOperation {
             inner: inventory.track(inner_merge_operation),
         }
+    }
+
+    // Release the inputs for candidate selection while keeping the operation in
+    // the inventory until any follow-up merges have been scheduled.
+    pub(crate) fn mark_completed(&self) {
+        self.inner.completed.store(true, Ordering::Relaxed);
     }
 
     /// Returns the opstamp up to which we want to consume the delete queue and reflect their

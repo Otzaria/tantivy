@@ -567,14 +567,13 @@ impl SegmentUpdater {
         scheduled_result
     }
 
-    pub(crate) fn get_mergeable_segments(&self) -> (Vec<SegmentMeta>, Vec<SegmentMeta>) {
-        let merge_segment_ids: HashSet<SegmentId> = self.merge_operations.segment_in_merge();
-        self.segment_manager
-            .get_mergeable_segments(&merge_segment_ids)
-    }
-
     fn consider_merge_options(&self) {
-        let (mut committed_segments, mut uncommitted_segments) = self.get_mergeable_segments();
+        if !self.is_alive() {
+            return;
+        }
+        let in_flight = self.merge_operations.segment_in_merge();
+        let (mut committed_segments, mut uncommitted_segments) =
+            self.segment_manager.get_mergeable_segments(&in_flight);
         if committed_segments.len() == 1 && committed_segments[0].num_deleted_docs() == 0 {
             committed_segments.clear();
         }
@@ -588,7 +587,7 @@ impl SegmentUpdater {
 
         let current_opstamp = self.stamper.stamp();
         let mut merge_candidates: Vec<MergeOperation> = merge_policy
-            .compute_merge_candidates(&uncommitted_segments)
+            .compute_merge_candidates_with_context(&uncommitted_segments, false, &in_flight)
             .into_iter()
             .map(|merge_candidate| {
                 MergeOperation::new(&self.merge_operations, current_opstamp, merge_candidate.0)
@@ -597,7 +596,7 @@ impl SegmentUpdater {
 
         let commit_opstamp = self.load_meta().opstamp;
         let committed_merge_candidates = merge_policy
-            .compute_merge_candidates(&committed_segments)
+            .compute_merge_candidates_with_context(&committed_segments, true, &in_flight)
             .into_iter()
             .map(|merge_candidate: MergeCandidate| {
                 MergeOperation::new(&self.merge_operations, commit_opstamp, merge_candidate.0)
@@ -618,15 +617,12 @@ impl SegmentUpdater {
         mut after_merge_segment_entry: Option<SegmentEntry>,
     ) -> crate::Result<Option<SegmentMeta>> {
         let segment_updater = self.clone();
-        let after_merge_segment_meta = after_merge_segment_entry
-            .as_ref()
-            .map(|after_merge_segment_entry| after_merge_segment_entry.meta().clone());
         self.schedule_task(move || {
             info!(
                 "End merge {:?}",
                 after_merge_segment_entry.as_ref().map(|entry| entry.meta())
             );
-            {
+            let after_merge_segment_meta = {
                 if let Some(after_merge_segment_entry) = after_merge_segment_entry.as_mut() {
                     // Deletes and commits could have happened as we were merging.
                     // We need to make sure we are up to date with deletes before accepting the
@@ -657,23 +653,40 @@ impl SegmentUpdater {
                     }
                 }
                 let previous_metas = segment_updater.load_meta();
-                let segments_status = segment_updater
+                let after_merge_segment_meta = after_merge_segment_entry
+                    .as_ref()
+                    .map(|entry| entry.meta().clone());
+                let segments_status = match segment_updater
                     .segment_manager
-                    .end_merge(merge_operation.segment_ids(), after_merge_segment_entry)?;
+                    .end_merge(merge_operation.segment_ids(), after_merge_segment_entry)
+                {
+                    Ok(status) => status,
+                    Err(error) => {
+                        // A commit can fully delete a merge input. Its files and the
+                        // unpublished output are now obsolete. Collect them before
+                        // reconsidering the other candidates.
+                        drop(after_merge_segment_meta);
+                        merge_operation.mark_completed();
+                        let _ = garbage_collect_files(segment_updater.clone());
+                        segment_updater.consider_merge_options();
+                        return Err(error);
+                    }
+                };
 
                 if segments_status == SegmentsStatus::Committed {
                     segment_updater
                         .save_metas(previous_metas.opstamp, previous_metas.payload.clone())?;
                 }
 
+                merge_operation.mark_completed();
                 segment_updater.consider_merge_options();
-            } // we drop all possible handle to a now useless `SegmentMeta`.
+                after_merge_segment_meta
+            }; // Drop the metadata handles before garbage collection.
 
             let _ = garbage_collect_files(segment_updater);
-            Ok(())
+            Ok(after_merge_segment_meta)
         })
-        .wait()?;
-        Ok(after_merge_segment_meta)
+        .wait()
     }
 
     /// Wait for current merging threads.

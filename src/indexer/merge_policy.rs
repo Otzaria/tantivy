@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt::Debug;
 use std::marker;
 
@@ -17,6 +18,17 @@ pub trait MergePolicy: marker::Send + marker::Sync + Debug {
     /// This call happens on the segment updater thread, and will block
     /// other segment updates, so all implementations should happen rapidly.
     fn compute_merge_candidates(&self, segments: &[SegmentMeta]) -> Vec<MergeCandidate>;
+
+    /// Like [Self::compute_merge_candidates], with the commit state of
+    /// `segments` and the inputs of unfinished merges in this writer.
+    fn compute_merge_candidates_with_context(
+        &self,
+        segments: &[SegmentMeta],
+        _committed: bool,
+        _in_flight: &HashSet<SegmentId>,
+    ) -> Vec<MergeCandidate> {
+        self.compute_merge_candidates(segments)
+    }
 }
 
 /// Never merge segments.
